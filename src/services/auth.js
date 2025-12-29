@@ -1,98 +1,116 @@
-import { auth, googleProvider, githubProvider } from '../config/firebase.js';
-import { signInWithPopup } from 'firebase/auth';
+import { auth, db, googleProvider, githubProvider } from '../config/firebase.js';
+import {
+  signInWithPopup,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  updateProfile
+} from 'firebase/auth';
+import { doc, setDoc, getDoc } from 'firebase/firestore';
 
-const USERS_KEY = 'lk_users';
 const SESSION_KEY = 'user_session';
-const API_BASE = '/api';
 
 export const AuthService = {
-  // getUsers() removed as we don't expose all users to client in real app
+  // Helper to get Role
+  async _getUserRole(uid, email) {
+    // Hardcoded Owner Admin Safety Net
+    if (email === 'owner@gmail.com') return 'admin';
+
+    try {
+      const docRef = doc(db, 'users', uid);
+      const docSnap = await getDoc(docRef);
+      if (docSnap.exists()) {
+        return docSnap.data().role || 'user';
+      }
+    } catch (e) { console.error('Role fetch failed', e); }
+    return 'user';
+  },
 
   async register(username, email, password) {
-    const res = await fetch(`${API_BASE}/register.php`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, email, password })
-    });
+    try {
+      const result = await createUserWithEmailAndPassword(auth, email, password);
+      const user = result.user;
 
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.message || 'Registration failed');
+      await updateProfile(user, { displayName: username });
+
+      // Create User Doc in Firestore
+      const role = (email === 'owner@gmail.com') ? 'admin' : 'user';
+      await setDoc(doc(db, 'users', user.uid), {
+        username,
+        email,
+        role,
+        created_at: new Date().toISOString()
+      });
+
+      return this._createSession(user, role);
+    } catch (error) {
+      throw new Error(error.message);
     }
-    return data;
   },
 
   async login(email, password) {
-    const res = await fetch(`${API_BASE}/login.php`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
-    });
-
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.message || 'Login failed');
+    try {
+      const result = await signInWithEmailAndPassword(auth, email, password);
+      const user = result.user;
+      const role = await this._getUserRole(user.uid, user.email);
+      return this._createSession(user, role);
+    } catch (error) {
+      throw new Error("Invalid Email or Password");
     }
+  },
 
-    // data.user should contain the user info
+  async loginWithGoogle() {
+    return this._socialLogin(googleProvider);
+  },
+
+  async loginWithGitHub() {
+    return this._socialLogin(githubProvider);
+  },
+
+  async _socialLogin(provider) {
+    try {
+      const result = await signInWithPopup(auth, provider);
+      const user = result.user;
+
+      // Check/Create Doc
+      const docRef = doc(db, 'users', user.uid);
+      const docSnap = await getDoc(docRef);
+      let role = 'user';
+
+      if (!docSnap.exists()) {
+        role = (user.email === 'owner@gmail.com') ? 'admin' : 'user';
+        await setDoc(docRef, {
+          username: user.displayName,
+          email: user.email,
+          role: role,
+          created_at: new Date().toISOString()
+        });
+      } else {
+        role = docSnap.data().role || 'user';
+        if (user.email === 'owner@gmail.com') role = 'admin';
+      }
+
+      return this._createSession(user, role);
+    } catch (e) { throw new Error(e.message); }
+  },
+
+  async _createSession(user, role) {
     const session = {
-      token: data.token,
-      user: data.user
+      token: await user.getIdToken(),
+      user: {
+        id: user.uid,
+        username: user.displayName,
+        email: user.email,
+        avatar: user.photoURL || `https://ui-avatars.com/api/?name=${encodeURIComponent(user.displayName || 'User')}&background=random`,
+        role: role
+      }
     };
     localStorage.setItem(SESSION_KEY, JSON.stringify(session));
     return session;
   },
 
-  async loginWithGoogle() {
-    try {
-      const result = await signInWithPopup(auth, googleProvider);
-      const user = result.user;
-
-      // Map Firebase user to App Session
-      const session = {
-        token: await user.getIdToken(),
-        user: {
-          id: user.uid,
-          username: user.displayName,
-          email: user.email,
-          avatar: user.photoURL
-        }
-      };
-
-      localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-      return session;
-    } catch (error) {
-      console.error(error);
-      throw new Error('Google Login Failed: ' + error.message);
-    }
-  },
-
-  async loginWithGitHub() {
-    try {
-      const result = await signInWithPopup(auth, githubProvider);
-      const user = result.user;
-
-      // Map Firebase user to App Session
-      const session = {
-        token: await user.getIdToken(),
-        user: {
-          id: user.uid,
-          username: user.displayName,
-          email: user.email,
-          avatar: user.photoURL
-        }
-      };
-
-      localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-      return session;
-    } catch (error) {
-      console.error(error);
-      throw new Error('GitHub Login Failed: ' + error.message);
-    }
-  },
-
   logout() {
     localStorage.removeItem(SESSION_KEY);
+    auth.signOut(); // Ensure Firebase session is cleared too
     window.location.hash = '/login';
   },
 
@@ -100,9 +118,7 @@ export const AuthService = {
     try {
       const session = JSON.parse(localStorage.getItem(SESSION_KEY));
       return session ? session.user : null;
-    } catch (e) {
-      return null;
-    }
+    } catch (e) { return null; }
   },
 
   isAuthenticated() {
